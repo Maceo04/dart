@@ -122,7 +122,7 @@ def insert_match_and_update(sel_keys: List[str], ranking_keys: List[str],
 
 def undo_last_match() -> bool:
     q = supabase.table("matches").select("*").order("timestamp", desc=True).limit(1).execute()
-    if not q.data
+    if not q.data:
         return False
     last = q.data[0]
     changes = last["elo_changes"] or {}
