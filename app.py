@@ -38,6 +38,60 @@ def key_name(name: str) -> str:
 def expected(ra: float, rb: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
 
+
+@st.cache_resource
+def get_conn():
+    from streamlit_gsheets import GSheetsConnection
+    return st.connection("gsheets", type=GSheetsConnection)
+
+conn = get_conn()
+
+@st.cache_data(ttl=60)
+def load_players_df_cached():
+    df = conn.read(worksheet="players", ttl=0)
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=["key","name","elo"])
+    df["elo"] = pd.to_numeric(df.get("elo", pd.Series(dtype=float)), errors="coerce").fillna(1000.0)
+    df["key"] = df.get("key", "").astype(str)
+    df["name"] = df.get("name", "").astype(str)
+    return df
+
+@st.cache_data(ttl=60)
+def load_matches_df_cached():
+    df = conn.read(worksheet="matches", ttl=0)
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=["id","timestamp","players_csv","ranking_csv","elo_changes_json"])
+    return df
+
+def invalidate_caches():
+    load_players_df_cached.clear()
+    load_matches_df_cached.clear()
+
+def save_players_df(df):
+    df = df.fillna("").astype(str)
+    conn.update(worksheet="players", data=df)
+    invalidate_caches()
+
+def save_matches_df(df):
+    df = df.fillna("").astype(str)
+    conn.update(worksheet="matches", data=df)
+    invalidate_caches()
+
+import time
+from gspread.exceptions import APIError
+
+def with_backoff(fn, *args, **kwargs):
+    delay = 1.0
+    for _ in range(5):
+        try:
+            return fn(*args, **kwargs)
+        except APIError:
+            time.sleep(delay)
+            delay *= 2
+    # dernière tentative
+    return fn(*args, **kwargs)
+
+
 # -----------------------
 # Accès Google Sheets
 # -----------------------
