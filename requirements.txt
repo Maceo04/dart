@@ -1,2 +1,3 @@
 streamlit>=1.30
 plotly>=5.20
+st-gsheets-connection>=0.1.0
