@@ -9,7 +9,8 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from streamlit_gsheets import GSheetsConnection
+from supabase import create_client
+from typing import Dict, List, Tuple
 
 # -----------------------
 # Configuration générale
@@ -24,12 +25,20 @@ st.set_page_config(
 BASE_ELO = 1000.0
 K_FACTOR = 32.0
 
-# Connexion Google Sheets (nécessite st-gsheets-connection et secrets)
-# Secrets attendus: [connections.gsheets] ... (service account + spreadsheet URL)
-conn = st.connection("gsheets", type=GSheetsConnection)
+# -----------------------
+# Connexion Supabase
+# -----------------------
+
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
+    key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = get_supabase()
 
 # -----------------------
-# Fonctions utilitaires
+# Utilitaires
 # -----------------------
 
 def key_name(name: str) -> str:
@@ -38,69 +47,22 @@ def key_name(name: str) -> str:
 def expected(ra: float, rb: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
 
-
-@st.cache_resource
-def get_conn():
-    from streamlit_gsheets import GSheetsConnection
-    return st.connection("gsheets", type=GSheetsConnection)
-
-conn = get_conn()
-
-@st.cache_data(ttl=60)
-def load_players_df_cached():
-    df = conn.read(worksheet="players", ttl=0)
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=["key","name","elo"])
-    df["elo"] = pd.to_numeric(df.get("elo", pd.Series(dtype=float)), errors="coerce").fillna(1000.0)
-    df["key"] = df.get("key", "").astype(str)
-    df["name"] = df.get("name", "").astype(str)
-    return df
-
-@st.cache_data(ttl=60)
-def load_matches_df_cached():
-    df = conn.read(worksheet="matches", ttl=0)
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=["id","timestamp","players_csv","ranking_csv","elo_changes_json"])
-    return df
-
 def invalidate_caches():
-    load_players_df_cached.clear()
-    load_matches_df_cached.clear()
-
-def save_players_df(df):
-    df = df.fillna("").astype(str)
-    conn.update(worksheet="players", data=df)
-    invalidate_caches()
-
-def save_matches_df(df):
-    df = df.fillna("").astype(str)
-    conn.update(worksheet="matches", data=df)
-    invalidate_caches()
-
-import time
-from gspread.exceptions import APIError
-
-def with_backoff(fn, *args, **kwargs):
-    delay = 1.0
-    for _ in range(5):
-        try:
-            return fn(*args, **kwargs)
-        except APIError:
-            time.sleep(delay)
-            delay *= 2
-    # dernière tentative
-    return fn(*args, **kwargs)
-
+    load_players_df.clear()
+    load_matches_df.clear()
 
 # -----------------------
-# Accès Google Sheets
+# Accès données (cache)
 # -----------------------
 
-def load_players_df():
-    df = conn.read(worksheet="players", ttl=0)
-    if df is None or df.empty:
+@st.cache_data(ttl=30)
+def load_players_df() -> pd.DataFrame:
+    resp = supabase.table("players").select("*").execute()
+    rows = resp.data or []
+    df = pd.DataFrame(rows, columns=["key", "name", "elo"])
+    if df.empty:
         df = pd.DataFrame(columns=["key", "name", "elo"])
-    # normaliser types
+    # types
     if "elo" in df.columns:
         df["elo"] = pd.to_numeric(df["elo"], errors="coerce").fillna(BASE_ELO)
     if "key" in df.columns:
@@ -109,39 +71,76 @@ def load_players_df():
         df["name"] = df["name"].astype(str)
     return df
 
-def save_players_df(df):
-    # Remplace l'onglet "players" par le DataFrame fourni
-    conn.update(worksheet="players", data=df)
-
-def load_matches_df():
-    df = conn.read(worksheet="matches", ttl=0)
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=["id", "timestamp", "players_csv", "ranking_csv", "elo_changes_json"])
+@st.cache_data(ttl=30)
+def load_matches_df() -> pd.DataFrame:
+    resp = supabase.table("matches").select("*").order("timestamp", desc=False).execute()
+    rows = resp.data or []
+    df = pd.DataFrame(rows, columns=["id", "timestamp", "players", "ranking", "elo_changes"])
+    if df.empty:
+        df = pd.DataFrame(columns=["id", "timestamp", "players", "ranking", "elo_changes"])
     return df
 
-def save_matches_df(df):
-    conn.update(worksheet="matches", data=df)
-
 # -----------------------
-# Logique Elo
+# Mutations Supabase
 # -----------------------
 
-def ensure_players_df(df_players, names):
-    """Crée les joueurs manquants (BASE_ELO) et met à jour les noms (affichage)."""
-    if df_players is None or df_players.empty:
-        df_players = pd.DataFrame(columns=["key", "name", "elo"])
-    existing = set(df_players["key"]) if not df_players.empty else set()
+def upsert_players(items: List[Dict]):
+    # items = [{"key": k, "name": name, "elo": float_val}, ...]
+    if not items:
+        return
+    supabase.table("players").upsert(items).execute()
+    invalidate_caches()
+
+def ensure_players(names: List[str]) -> pd.DataFrame:
+    df = load_players_df()
+    existing = set(df["key"]) if not df.empty else set()
+    batch = []
     for name in names:
         k = key_name(name)
         if k in existing:
-            df_players.loc[df_players["key"] == k, "name"] = name.strip()
+            # mettre à jour l'affichage du nom
+            supabase.table("players").update({"name": name.strip()}).eq("key", k).execute()
         else:
-            df_players.loc[len(df_players)] = {"key": k, "name": name.strip(), "elo": BASE_ELO}
-    save_players_df(df_players)
+            batch.append({"key": k, "name": name.strip(), "elo": BASE_ELO})
+    if batch:
+        supabase.table("players").insert(batch).execute()
+    invalidate_caches()
     return load_players_df()
 
-def update_ratings_multiplayer_from_df(df_players, sel_keys, ranking_keys, K=K_FACTOR):
-    """Mise à jour Elo pairwise moyenne pour 2 à 4 joueurs."""
+def insert_match_and_update(sel_keys: List[str], ranking_keys: List[str],
+                            olds: Dict[str, float], news: Dict[str, float]):
+    changes = {k: {"old": float(olds[k]), "new": float(news[k]), "delta": float(news[k] - olds[k])} for k in sel_keys}
+    supabase.table("matches").insert({
+        "timestamp": datetime.utcnow().isoformat(),
+        "players": sel_keys,
+        "ranking": ranking_keys,
+        "elo_changes": changes
+    }).execute()
+    payload = [{"key": k, "name": k, "elo": float(news[k])} for k in sel_keys]
+    supabase.table("players").upsert(payload).execute()
+    invalidate_caches()
+
+def undo_last_match() -> bool:
+    q = supabase.table("matches").select("*").order("timestamp", desc=True).limit(1).execute()
+    if not q.
+        return False
+    last = q.data[0]
+    changes = last["elo_changes"] or {}
+    restores = [{"key": k, "name": k, "elo": float(v["old"])} for k, v in changes.items()]
+    if restores:
+        supabase.table("players").upsert(restores).execute()
+    supabase.table("matches").delete().eq("id", last["id"]).execute()
+    invalidate_caches()
+    return True
+
+# -----------------------
+# Elo multi-joueurs
+# -----------------------
+
+def update_ratings_multiplayer(df_players: pd.DataFrame,
+                               sel_keys: List[str],
+                               ranking_keys: List[str],
+                               K: float = K_FACTOR) -> Tuple[Dict[str, float], Dict[str, float]]:
     pos = {k: i for i, k in enumerate(ranking_keys)}
     olds = {}
     for k in sel_keys:
@@ -163,31 +162,8 @@ def update_ratings_multiplayer_from_df(df_players, sel_keys, ranking_keys, K=K_F
         news[i] = ri + delta
     return olds, news
 
-def record_match_sheet(sel_keys, ranking_keys, olds, news):
-    df = load_matches_df()
-    changes = {k: {"old": float(olds[k]), "new": float(news[k]), "delta": float(news[k] - olds[k])} for k in sel_keys}
-    row = {
-        "id": str(uuid.uuid4()),
-        "timestamp": datetime.now().isoformat(),
-        "players_csv": ",".join(sel_keys),
-        "ranking_csv": ",".join(ranking_keys),
-        "elo_changes_json": json.dumps(changes, ensure_ascii=False)
-    }
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_matches_df(df)
-    return row
-
-def apply_elo_updates(df_players, news):
-    idx = {k: i for i, k in enumerate(df_players["key"])} if not df_players.empty else {}
-    for k, new_elo in news.items():
-        i = idx.get(k, None)
-        if i is not None:
-            df_players.at[i, "elo"] = float(new_elo)
-    save_players_df(df_players)
-    return load_players_df()
-
 # -----------------------
-# Interface
+# Interface utilisateur
 # -----------------------
 
 st.title("🎯 Classement Elo Fléchettes")
@@ -259,24 +235,21 @@ elif menu == "Nouvelle Partie":
                 st.error("Chaque position doit être attribuée à un seul joueur !")
             else:
                 if st.button("Enregistrer la partie", type="primary"):
-                    # 1) S'assurer que tous existent / mettre à jour les noms
-                    df_players = ensure_players_df(df_players, selected_players)
+                    # Assurer l’existence et la mise à jour des noms
+                    df_players = ensure_players(selected_players)
 
-                    # 2) Dériver les clés et l'ordre
+                    # Dériver les clés et l’ordre
                     sel_keys = [key_name(n) for n in selected_players]
                     sorted_players = sorted(selected_players, key=lambda p: rankings[p])
                     ranking_keys = [key_name(p) for p in sorted_players]
 
-                    # 3) Calcul Elo
-                    olds, news = update_ratings_multiplayer_from_df(df_players, sel_keys, ranking_keys, K_FACTOR)
+                    # Calcul Elo
+                    olds, news = update_ratings_multiplayer(df_players, sel_keys, ranking_keys, K_FACTOR)
 
-                    # 4) Enregistrer match
-                    record_match_sheet(sel_keys, ranking_keys, olds, news)
+                    # Enregistrer match + appliquer Elo
+                    insert_match_and_update(sel_keys, ranking_keys, olds, news)
 
-                    # 5) Appliquer Elo
-                    df_players = apply_elo_updates(df_players, news)
-
-                    # 6) Feedback
+                    # Feedback
                     st.success("✅ Partie enregistrée avec succès !")
                     st.subheader("Changements de classement")
                     for player in sorted_players:
@@ -293,20 +266,18 @@ elif menu == "Nouvelle Partie":
 
 elif menu == "Ajouter un Joueur":
     st.header("Ajouter un Nouveau Joueur")
-    df_players = load_players_df()
     new_player_name = st.text_input("Nom du joueur")
     if st.button("Ajouter", type="primary"):
         if not new_player_name.strip():
             st.error("Le nom du joueur ne peut pas être vide !")
         else:
             k = key_name(new_player_name)
-            if not df_players.empty and (df_players["key"] == k).any():
+            # Vérifier existant
+            df = load_players_df()
+            if not df.empty and (df["key"] == k).any():
                 st.warning(f"Le joueur '{new_player_name}' existe déjà dans la base !")
             else:
-                # append puis save
-                new_row = {"key": k, "name": new_player_name.strip(), "elo": BASE_ELO}
-                df_players = pd.concat([df_players, pd.DataFrame([new_row])], ignore_index=True)
-                save_players_df(df_players)
+                upsert_players([{"key": k, "name": new_player_name.strip(), "elo": BASE_ELO}])
                 st.success(f"✅ Joueur '{new_player_name}' ajouté avec un Elo de {BASE_ELO} !")
                 st.rerun()
 
@@ -322,17 +293,11 @@ elif menu == "Historique":
         st.write(f"**{len(df_sorted)}** parties jouées au total")
 
         if st.button("🗑️ Annuler la dernière partie", type="secondary"):
-            last = df_sorted.iloc[0].to_dict()
-            changes = json.loads(last["elo_changes_json"])
-            # Restaurer anciens elos
-            for k, v in changes.items():
-                df_players.loc[df_players["key"] == k, "elo"] = float(v["old"])
-            save_players_df(df_players)
-            # Supprimer la ligne de match
-            df_new = df_matches[df_matches["id"] != last["id"]].reset_index(drop=True)
-            save_matches_df(df_new)
-            st.success("✅ Dernière partie annulée avec succès !")
-            st.rerun()
+            if undo_last_match():
+                st.success("✅ Dernière partie annulée avec succès !")
+                st.rerun()
+            else:
+                st.info("Aucune partie à annuler.")
 
         st.divider()
 
@@ -341,8 +306,8 @@ elif menu == "Historique":
                 ts = datetime.fromisoformat(row["timestamp"])
             except Exception:
                 ts = datetime.utcnow()
-            ranking_keys = row["ranking_csv"].split(",") if row["ranking_csv"] else []
-            changes = json.loads(row["elo_changes_json"]) if row["elo_changes_json"] else {}
+            ranking_keys = row.get("ranking", []) or []
+            changes = row.get("elo_changes", {}) or {}
 
             with st.expander(f"Partie {len(df_sorted)-idx} - {ts.strftime('%d/%m/%Y à %H:%M')}"):
                 st.write("**Classement :**")
@@ -360,7 +325,9 @@ elif menu == "Historique":
                     with col2:
                         st.write(f"**{player_name}**")
                     with col3:
-                        st.markdown(f":{color}[{ch.get('old','?')} → {ch.get('new','?')} ({sign}{delta})]")
+                        old_v = ch.get("old", "?")
+                        new_v = ch.get("new", "?")
+                        st.markdown(f":{color}[{old_v} → {new_v} ({sign}{delta})]")
 
 elif menu == "Statistiques":
     st.header("Statistiques des Joueurs")
@@ -372,7 +339,7 @@ elif menu == "Statistiques":
     elif df_matches.empty:
         st.info("Aucune partie jouée. Les statistiques apparaîtront après les premières parties.")
     else:
-        # Préparer stats par joueur
+        # Stats par joueur
         stats = {}
         for _, p in df_players.iterrows():
             stats[p["key"]] = {
@@ -386,12 +353,11 @@ elif menu == "Statistiques":
                 "max_elo": BASE_ELO,
             }
 
-        # Parcourir matches en ordre chronologique
         df_chrono = df_matches.sort_values("timestamp", ascending=True)
         for _, m in df_chrono.iterrows():
-            ranking = (m["ranking_csv"].split(",") if m["ranking_csv"] else [])
-            players = (m["players_csv"].split(",") if m["players_csv"] else [])
-            changes = json.loads(m["elo_changes_json"]) if m["elo_changes_json"] else {}
+            ranking = m.get("ranking", []) or []
+            players = m.get("players", []) or []
+            changes = m.get("elo_changes", {}) or {}
 
             for k in players:
                 if k not in stats:
@@ -403,7 +369,6 @@ elif menu == "Statistiques":
                     pos = ranking.index(k)
                     if pos < 3:
                         stats[k]["podiums"] += 1
-                # Historique Elo
                 if k in changes and "new" in changes[k]:
                     new_elo = float(changes[k]["new"])
                     stats[k]["elo_history"].append(new_elo)
@@ -440,8 +405,7 @@ elif menu == "Graphiques":
     if df_matches.empty:
         st.info("Aucune partie jouée. Les graphiques apparaîtront après les premières parties.")
     else:
-        # Construire séries par joueur
-        # Timestamps triés
+        # Séries par joueur
         df_chrono = df_matches.sort_values("timestamp", ascending=True).reset_index(drop=True)
         first_ts = None
         if not df_chrono.empty:
@@ -449,21 +413,18 @@ elif menu == "Graphiques":
                 first_ts = datetime.fromisoformat(df_chrono.loc[0, "timestamp"])
             except Exception:
                 first_ts = datetime.utcnow()
+
         player_series = {}
         for _, p in df_players.iterrows():
-            player_series[p["key"]] = {
-                "name": p["name"],
-                "timestamps": [],
-                "elos": [BASE_ELO],
-            }
+            player_series[p["key"]] = {"name": p["name"], "timestamps": [], "elos": [BASE_ELO]}
 
         for _, m in df_chrono.iterrows():
             try:
                 ts = datetime.fromisoformat(m["timestamp"])
             except Exception:
                 ts = datetime.utcnow()
-            players = (m["players_csv"].split(",") if m["players_csv"] else [])
-            changes = json.loads(m["elo_changes_json"]) if m["elo_changes_json"] else {}
+            players = m.get("players", []) or []
+            changes = m.get("elo_changes", {}) or {}
             for k in players:
                 if k in player_series and k in changes and "new" in changes[k]:
                     player_series[k]["timestamps"].append(ts)
@@ -493,11 +454,10 @@ elif menu == "Graphiques":
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Focus sur un joueur
+        # Focus joueur
         with_names = [data["name"] for data in player_series.values() if len(data["timestamps"]) > 0]
         if with_names:
             selected_player_name = st.selectbox("Voir le détail pour un joueur", with_names)
-            # retrouver la clé
             selected_key = None
             for k, data in player_series.items():
                 if data["name"] == selected_player_name and data["timestamps"]:
@@ -533,7 +493,6 @@ elif menu == "Exporter":
 
     st.subheader("Exporter les joueurs")
     if not df_players.empty:
-        # CSV joueurs
         df_sorted = df_players.sort_values("elo", ascending=False)
         csv_players = "Nom,Elo\n" + "\n".join(
             f"{row['name']},{float(row['elo']):.1f}" for _, row in df_sorted.iterrows()
@@ -552,7 +511,8 @@ elif menu == "Exporter":
     st.subheader("Exporter l'historique des parties")
     if not df_matches.empty:
         csv_matches = "Date,Heure,Premier,Deuxieme,Troisieme,Quatrieme\n"
-        for _, m in df_matches.iterrows():
+        # trier par timestamp asc pour un export chronologique
+        for _, m in df_matches.sort_values("timestamp", ascending=True).iterrows():
             try:
                 dt = datetime.fromisoformat(m["timestamp"])
             except Exception:
@@ -560,8 +520,8 @@ elif menu == "Exporter":
             date_str = dt.strftime("%d/%m/%Y")
             time_str = dt.strftime("%H:%M:%S")
 
-            ranking_keys = m["ranking_csv"].split(",") if m["ranking_csv"] else []
-            changes = json.loads(m["elo_changes_json"]) if m["elo_changes_json"] else {}
+            ranking_keys = m.get("ranking", []) or []
+            changes = m.get("elo_changes", {}) or {}
 
             players_out = []
             for k in ranking_keys:
@@ -586,10 +546,10 @@ elif menu == "Exporter":
 
 # Sidebar infos
 st.sidebar.divider()
-st.sidebar.caption("💾 Base de données: Google Sheets (connexion sécurisée)")
 try:
     _df_p = load_players_df()
     _df_m = load_matches_df()
+    st.sidebar.caption("💾 Base de données: Supabase (Postgres managé)")
     st.sidebar.caption(f"👥 {len(_df_p)} joueurs enregistrés")
     st.sidebar.caption(f"🎯 {len(_df_m)} parties jouées")
 except Exception:
